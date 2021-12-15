@@ -34,11 +34,14 @@ class MetricIds(Enum):
     AQI = "aqi"
     AQI_2_5 = "aqi pm2.5"
     AQI_10_0 = "aqi pm10.0"
-    PM_1_0 = "pm1.0"
-    PM_2_5 = "pm2.5"
-    PM_10_0 = "pm10.0"
+    MASS_CONCENTRATION = "mass_concentration"
+    PARTICLE_COUNT = "particle_count"
     TEMPERATURE = "temperature"
     HUMIDITY = "humidity"
+    AIR_PRESSURE = "air_pressure"
+
+
+LabeledJsonKey = Tuple[str, Dict[str, str]]
 
 
 @attr.s(frozen=True)
@@ -48,6 +51,7 @@ class Metric:
     help_text = attr.ib(type=str)
     local_json_key = attr.ib(type=Optional[str], default=None)
     remote_json_key = attr.ib(type=Optional[str], default=None)
+    labeled_json_keys = attr.ib(type=Optional[List[LabeledJsonKey]], default=None)
     multiple_sensors = attr.ib(type=bool, default=False)
     computed = attr.ib(type=bool, default=False)
 
@@ -59,7 +63,7 @@ class Stat:
     labels = attr.ib(type=dict)
 
 
-METRICS = {
+METRICS = [
     Metric(
         id=MetricIds.AQI,
         name="purpleair_aqi",
@@ -79,32 +83,33 @@ METRICS = {
         computed=True,
     ),
     Metric(
-        id=MetricIds.PM_1_0,
-        name="purpleair_pm_1_0",
-        help_text="PM1.0 at sensor.",
-        local_json_key="pm1_0_atm",
-        remote_json_key="pm1_0_atm",
+        id=MetricIds.MASS_CONCENTRATION,
+        name="purpleair_mass_concentration",
+        help_text="Mass concentration at sensor.",
+        labeled_json_keys=[
+            ("pm1_0_atm", {"particle_size": "PM1.0", "particle_size_um": "1.0"}),
+            ("pm2_5_atm", {"particle_size": "PM2.5", "particle_size_um": "2.5"}),
+            ("pm10_0_atm", {"particle_size": "PM10.0", "particle_size_um": "10.0"}),
+        ],
         multiple_sensors=True,
     ),
     Metric(
-        id=MetricIds.PM_2_5,
-        name="purpleair_pm_2_5",
-        help_text="PM2.5 at sensor.",
-        local_json_key="pm2_5_atm",
-        remote_json_key="pm2_5_atm",
-        multiple_sensors=True,
-    ),
-    Metric(
-        id=MetricIds.PM_10_0,
-        name="purpleair_pm_10_0",
-        help_text="PM10.0 at sensor.",
-        local_json_key="pm10_0_atm",
-        remote_json_key="pm10_0_atm",
+        id=MetricIds.PARTICLE_COUNT,
+        name="purpleair_particle_count",
+        help_text="Particle count at sensor.",
+        labeled_json_keys=[
+            ("p_0_3_um", {"particle_size": ">0.3um"}),
+            ("p_0_5_um", {"particle_size": ">0.5um"}),
+            ("p_1_0_um", {"particle_size": ">1.0um"}),
+            ("p_2_5_um", {"particle_size": ">2.5um"}),
+            ("p_5_0_um", {"particle_size": ">5.0um"}),
+            ("p_10_0_um", {"particle_size": ">10.0um"}),
+        ],
         multiple_sensors=True,
     ),
     Metric(
         id=MetricIds.TEMPERATURE,
-        name="purpleair_temperature",
+        name="purpleair_temp_f",
         help_text="Temperature at sensor. May be corrected during import.",
         local_json_key="current_temp_f",
         remote_json_key="temp_f",
@@ -116,7 +121,14 @@ METRICS = {
         local_json_key="current_humidity",
         remote_json_key="humidity",
     ),
-}
+    Metric(
+        id=MetricIds.AIR_PRESSURE,
+        name="purpleair_air_pressure",
+        help_text="Air pressure at sensor. May be corrected during import.",
+        local_json_key="pressure",
+        remote_json_key="pressure",
+    ),
+]
 
 
 class Config:
@@ -231,13 +243,26 @@ class PurpleAirCollector:
                 )
 
         for metric in METRICS:
+            labels = self.config.all_tag_keys
+            if metric.labeled_json_keys:
+                label_set = set(metric.labeled_json_keys[0][1].keys())
+                for _, label_dict in metric.labeled_json_keys:
+                    label_set_b = set(label_dict.keys())
+                    assert label_set_b == label_set, "Metric labels do not match"
+                labels = labels.union(label_set)
+
+            labels_dict = dict([(label, None) for label in labels])
             gauge = GaugeMetricFamily(
                 metric.name,
                 metric.help_text,
-                labels=self.config.all_tag_keys,
+                labels=labels_dict.keys(),
             )
             for stat in stats_by_metric[metric.id]:
-                gauge.add_metric(stat.labels.values(), stat.value)
+                for k, v in stat.labels.items():
+                    # Update the labels dict so that it can be used to
+                    # produce values in the correct order
+                    labels_dict[k] = v
+                gauge.add_metric(labels_dict.values(), stat.value)
             yield gauge
 
     def collect_gauges_for_local_device(self, device: Device) -> Iterable[Stat]:
@@ -250,33 +275,49 @@ class PurpleAirCollector:
             if metric.computed:
                 continue
 
-            assert metric.local_json_key, "Metrics are misconfigured"
             if metric.multiple_sensors:
-                yield Stat(
-                    id=metric.id,
-                    value=float(data[metric.local_json_key]),
-                    labels=dict(labels, sensor="A"),
-                )
-                yield Stat(
-                    id=metric.id,
-                    value=float(data[metric.local_json_key + "_b"]),
-                    labels=dict(labels, sensor="B"),
-                )
+                if metric.local_json_key:
+                    yield Stat(
+                        id=metric.id,
+                        value=float(data[metric.local_json_key]),
+                        labels=dict(labels, sensor="A"),
+                    )
+                    yield Stat(
+                        id=metric.id,
+                        value=float(data[metric.local_json_key + "_b"]),
+                        labels=dict(labels, sensor="B"),
+                    )
+                elif metric.labeled_json_keys:
+                    for json_key, additional_labels in metric.labeled_json_keys:
+                        yield Stat(
+                            id=metric.id,
+                            value=float(data[json_key]),
+                            labels=dict(labels, **additional_labels, sensor="A"),
+                        )
+                        yield Stat(
+                            id=metric.id,
+                            value=float(data[json_key + "_b"]),
+                            labels=dict(labels, **additional_labels, sensor="B"),
+                        )
+                else:
+                    raise InvalidConfigurationError("Metrics are misconfigured")
 
-                # See below
-                if metric.id == MetricIds.PM_2_5:
-                    pm2_5_a = float(data[metric.local_json_key])
-                    pm2_5_b = float(data[metric.local_json_key + "_b"])
-                if metric.id == MetricIds.PM_10_0:
-                    pm10_a = float(data[metric.local_json_key])
-                    pm10_b = float(data[metric.local_json_key + "_b"])
             else:
-                yield Stat(
-                    id=metric.id, value=data[metric.local_json_key], labels=labels
-                )
+                if metric.local_json_key:
+                    yield Stat(
+                        id=metric.id,
+                        value=data[metric.local_json_key],
+                        labels=labels,
+                    )
+                else:
+                    raise InvalidConfigurationError("Metrics are misconfigured")
 
         # The following could be made generic and programatic, but it's more trouble than
         # its worth until there are other calculations besides AQI.
+        pm2_5_a = float(data["pm2_5_atm"])
+        pm2_5_b = float(data["pm2_5_atm_b"])
+        pm10_a = float(data["pm10_0_atm"])
+        pm10_b = float(data["pm10_0_atm_b"])
         for sensor, pm2_5, pm10 in [("A", pm2_5_a, pm10_a), ("B", pm2_5_b, pm10_b)]:
             aqi_std = aqi.to_aqi(
                 [
@@ -316,35 +357,49 @@ class PurpleAirCollector:
             if metric.computed:
                 continue
 
-            assert metric.remote_json_key, "Metrics are misconfigured"
             if metric.multiple_sensors:
-                yield Stat(
-                    id=metric.id,
-                    value=float(results[0][metric.remote_json_key]),
-                    labels=dict(labels, sensor="A"),
-                )
-                yield Stat(
-                    id=metric.id,
-                    value=float(results[1][metric.remote_json_key]),
-                    labels=dict(labels, sensor="B"),
-                )
+                if metric.remote_json_key:
+                    yield Stat(
+                        id=metric.id,
+                        value=float(results[0][metric.remote_json_key]),
+                        labels=dict(labels, sensor="A"),
+                    )
+                    yield Stat(
+                        id=metric.id,
+                        value=float(results[1][metric.remote_json_key]),
+                        labels=dict(labels, sensor="B"),
+                    )
+                elif metric.labeled_json_keys:
+                    for json_key, additional_labels in metric.labeled_json_keys:
+                        yield Stat(
+                            id=metric.id,
+                            value=float(results[0][json_key]),
+                            labels=dict(labels, **additional_labels, sensor="A"),
+                        )
+                        yield Stat(
+                            id=metric.id,
+                            value=float(results[1][json_key]),
+                            labels=dict(labels, **additional_labels, sensor="B"),
+                        )
+                else:
+                    raise InvalidConfigurationError("Metrics are misconfigured")
 
-                # See below
-                if metric.id == MetricIds.PM_2_5:
-                    pm2_5_a = float(results[0][metric.remote_json_key])
-                    pm2_5_b = float(results[1][metric.remote_json_key])
-                if metric.id == MetricIds.PM_10_0:
-                    pm10_a = float(results[0][metric.remote_json_key])
-                    pm10_b = float(results[1][metric.remote_json_key])
             else:
-                yield Stat(
-                    id=metric.id,
-                    value=results[0][metric.remote_json_key],
-                    labels=labels,
-                )
+                if metric.remote_json_key:
+                    yield Stat(
+                        id=metric.id,
+                        value=results[0][metric.remote_json_key],
+                        labels=labels,
+                    )
+                else:
+                    raise InvalidConfigurationError("Metrics are misconfigured")
 
         # The following could be made generic and programatic, but it's more trouble than
         # its worth until there are other calculations besides AQI.
+        pm2_5_a = float(results[0]["pm2_5_atm"])
+        pm2_5_b = float(results[1]["pm2_5_atm"])
+        pm10_a = float(results[0]["pm10_0_atm"])
+        pm10_b = float(results[1]["pm10_0_atm"])
         for sensor, pm2_5, pm10 in [("A", pm2_5_a, pm10_a), ("B", pm2_5_b, pm10_b)]:
             aqi_std = aqi.to_aqi(
                 [
