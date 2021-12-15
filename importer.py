@@ -7,16 +7,10 @@ from threading import Event, Lock
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import attr
+import aqi
 from prometheus_client import start_http_server, Gauge  # type: ignore
 from requests_cache import CachedSession
 import yaml
-
-
-def as_float(val: Any) -> Optional[float]:
-    try:
-        return float(val)
-    except:
-        return None
 
 
 class InvalidConfigurationError(Exception):
@@ -24,7 +18,7 @@ class InvalidConfigurationError(Exception):
 
 
 @attr.s
-class Sensor:
+class Device:
     tags = attr.ib(type=dict)
     corrections = attr.ib(type=dict)
     url = attr.ib(type=str)
@@ -33,6 +27,12 @@ class Sensor:
 
 
 class Metric(Enum):
+    AQI = "aqi"
+    AQI_2_5 = "aqi pm2.5"
+    AQI_10_0 = "aqi pm10.0"
+    PM_1_0 = "pm1.0"
+    PM_2_5 = "pm2.5"
+    PM_10_0 = "pm10.0"
     TEMPERATURE = "temperature"
     HUMIDITY = "humidity"
 
@@ -42,14 +42,14 @@ class Config:
         with open(path, "r") as config_file:
             self.config_dict = yaml.load(config_file, Loader=yaml.Loader)
 
-        self.all_tag_keys = set()  # type: Set[str]
-        self.all_sensors = list()  # type: List[Sensor]
+        self.all_tag_keys = {"sensor"}
+        self.all_devices = list()  # type: List[Device]
 
         if "local" in self.config_dict:
             for item_dict in self.config_dict["local"]:
                 if "hostname" not in item_dict:
                     raise InvalidConfigurationError(
-                        "Hostname required for all local sensors"
+                        "Hostname required for all local devices"
                     )
                 hostname = item_dict["hostname"]
                 url = "http://{}/json?live=true".format(hostname)
@@ -58,7 +58,7 @@ class Config:
                     raise InvalidConfigurationError(
                         "Tags for {} must be a dictionary".format(hostname)
                     )
-                tags["hostname"] = hostname
+                tags["id"] = hostname
 
                 corrections = item_dict.get("corrections", dict())
                 if not isinstance(corrections, dict):
@@ -75,8 +75,8 @@ class Config:
                         )
                     )
 
-                self.all_sensors.append(
-                    Sensor(
+                self.all_devices.append(
+                    Device(
                         hostname=hostname, url=url, tags=tags, corrections=corrections
                     )
                 )
@@ -85,7 +85,7 @@ class Config:
         if "map" in self.config_dict:
             for item_dict in self.config_dict["map"]:
                 if "id" not in item_dict:
-                    raise InvalidConfigurationError("id required for all map sensors")
+                    raise InvalidConfigurationError("id required for all map devices")
                 id = item_dict["id"]
                 url = "https://www.purpleair.com/json?show={}".format(id)
                 tags = item_dict.get("tags")
@@ -110,8 +110,8 @@ class Config:
                         )
                     )
 
-                self.all_sensors.append(
-                    Sensor(map_id=id, url=url, tags=tags, corrections=corrections)
+                self.all_devices.append(
+                    Device(map_id=id, url=url, tags=tags, corrections=corrections)
                 )
                 self.all_tag_keys = self.all_tag_keys.union(tags.keys())
 
@@ -124,6 +124,36 @@ class QueryEngine:
         self.local_query_session = CachedSession(expire_after=local_query_interval)
         self.map_query_session = CachedSession(expire_after=map_query_interval)
         self.gauges = {
+            Metric.AQI: Gauge(
+                "purpleair_aqi",
+                "AQI at sensor.",
+                labelnames=self.config.all_tag_keys,
+            ),
+            Metric.AQI_2_5: Gauge(
+                "purpleair_aqi_pm_2_5",
+                "AQI for PM2.5 at sensor.",
+                labelnames=self.config.all_tag_keys,
+            ),
+            Metric.AQI_10_0: Gauge(
+                "purpleair_aqi_pm_10_0",
+                "AQI for PM10.0 at sensor.",
+                labelnames=self.config.all_tag_keys,
+            ),
+            Metric.PM_1_0: Gauge(
+                "purpleair_pm_1_0",
+                "PM1.0 at sensor.",
+                labelnames=self.config.all_tag_keys,
+            ),
+            Metric.PM_2_5: Gauge(
+                "purpleair_pm_2_5",
+                "PM2.5 at sensor.",
+                labelnames=self.config.all_tag_keys,
+            ),
+            Metric.PM_10_0: Gauge(
+                "purpleair_pm_10_0",
+                "PM10.0 at sensor.",
+                labelnames=self.config.all_tag_keys,
+            ),
             Metric.TEMPERATURE: Gauge(
                 "purpleair_temperature",
                 "Temperature at sensor. May be corrected during import.",
@@ -137,30 +167,79 @@ class QueryEngine:
         }
 
     def build_gauges(self) -> None:
-        for sensor in self.config.all_sensors:
+        for device in self.config.all_devices:
             for metric, gauge in self.gauges.items():
-                gauge.labels(**sensor.tags).set_function(
-                    partial(self.get_stat, sensor, metric)
-                )
+                for sensor in "a", "b":
+                    labels = {
+                        k: device.tags.get(k, "") for k in self.config.all_tag_keys
+                    }
+                    labels["sensor"] = sensor
+                    gauge.labels(**labels).set_function(
+                        partial(self.get_stat, device, metric, sensor)
+                    )
 
-    def get_stat(self, sensor: Sensor, metric: Metric) -> float:
-        if sensor.hostname:
-            response = self.local_query_session.get(sensor.url)
+    def get_stat(self, device: Device, metric: Metric, sensor: str) -> float:
+        if device.hostname:
+            response = self.local_query_session.get(device.url)
+            data = response.json()
+            if sensor == "a":
+                suffix = ""
+            else:
+                suffix = "_b"
         else:
-            response = self.map_query_session.get(sensor.url)
-        results = response.json()["results"]
-        assert len(results) == 2
+            response = self.map_query_session.get(device.url)
+            results = response.json()["results"]
+            assert len(results) == 2
+            assert sensor in {"a", "b"}
+            if sensor == "a":
+                data = results[0]
+            else:
+                data = results[1]
+            suffix = ""
 
-        if metric == Metric.TEMPERATURE:
-            return as_float(results[0].get("temp_f")) or as_float(
-                results[1].get("temp_f")
+        if metric == Metric.AQI:
+            pm2_5 = self._get_stat(data, ["pm2_5_atm", "pm2_5_cf_1"], suffix)
+            pm10 = self._get_stat(data, ["pm10_0_atm", "pm10_0_cf_1"], suffix)
+            return aqi.to_aqi(
+                [
+                    (aqi.POLLUTANT_PM25, pm2_5),
+                    (aqi.POLLUTANT_PM10, pm10),
+                ]
             )
+        elif metric == Metric.AQI_2_5:
+            pm2_5 = self._get_stat(data, ["pm2_5_atm", "pm2_5_cf_1"], suffix)
+            return aqi.to_aqi(
+                [
+                    (aqi.POLLUTANT_PM25, pm2_5),
+                ]
+            )
+        elif metric == Metric.AQI_10_0:
+            pm10 = self._get_stat(data, ["pm10_0_atm", "pm10_0_cf_1"], suffix)
+            return aqi.to_aqi(
+                [
+                    (aqi.POLLUTANT_PM10, pm10),
+                ]
+            )
+        elif metric == Metric.PM_1_0:
+            return self._get_stat(data, ["pm1_0_atm", "pm1_0_cf_1"], suffix)
+        elif metric == Metric.PM_2_5:
+            return self._get_stat(data, ["pm2_5_atm", "pm2_5_cf_1"], suffix)
+        elif metric == Metric.PM_10_0:
+            return self._get_stat(data, ["pm10_0_atm", "pm10_0_cf_1"], suffix)
+        elif metric == Metric.TEMPERATURE:
+            return self._get_stat(data, ["temp_f", "current_temp_f"], suffix)
         elif metric == Metric.HUMIDITY:
-            return as_float(results[0].get("humidity")) or as_float(
-                results[1].get("humidity")
-            )
+            return self._get_stat(data, ["humidity", "current_humidity"], suffix)
         else:
             return 0
+
+    def _get_stat(self, data, keys, suffix) -> Optional[float]:
+        for key in keys:
+            try:
+                return float(data[key + suffix])
+            except:
+                pass
+        return 0
 
 
 if __name__ == "__main__":
