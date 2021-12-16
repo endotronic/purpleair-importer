@@ -21,15 +21,6 @@ class InvalidConfigurationError(Exception):
     pass
 
 
-@attr.s
-class Device:
-    tags = attr.ib(type=dict)
-    corrections = attr.ib(type=dict)
-    url = attr.ib(type=str)
-    hostname = attr.ib(type=Optional[str], default=None)
-    map_id = attr.ib(type=Optional[str], default=None)
-
-
 class MetricIds(Enum):
     AQI = "aqi"
     AQI_2_5 = "aqi pm2.5"
@@ -42,6 +33,15 @@ class MetricIds(Enum):
 
 
 LabeledJsonKey = Tuple[str, Dict[str, str]]
+
+
+@attr.s
+class Device:
+    tags = attr.ib(type=Dict[str, str])
+    corrections = attr.ib(type=Dict[MetricIds, float])
+    url = attr.ib(type=str)
+    hostname = attr.ib(type=Optional[str], default=None)
+    map_id = attr.ib(type=Optional[str], default=None)
 
 
 @attr.s(frozen=True)
@@ -60,6 +60,7 @@ class Metric:
 class Stat:
     id = attr.ib(type=MetricIds)
     value = attr.ib(type=float)
+    correction = attr.ib(type=float)
     labels = attr.ib(type=dict)
 
 
@@ -109,14 +110,14 @@ METRICS = [
     ),
     Metric(
         id=MetricIds.TEMPERATURE,
-        name="purpleair_temp_f",
+        name="purpleair_temperature_f",
         help_text="Temperature at sensor. May be corrected during import.",
         local_json_key="current_temp_f",
         remote_json_key="temp_f",
     ),
     Metric(
         id=MetricIds.HUMIDITY,
-        name="purpleair_humidity",
+        name="purpleair_relative_humidity",
         help_text="Humidity at sensor. May be corrected during import.",
         local_json_key="current_humidity",
         remote_json_key="humidity",
@@ -154,7 +155,10 @@ class Config:
                     )
                 tags["id"] = hostname
 
-                corrections = item_dict.get("corrections", dict())
+                corrections = {
+                    k.upper(): v
+                    for k, v in item_dict.get("corrections", dict()).items()
+                }
                 if not isinstance(corrections, dict):
                     raise InvalidConfigurationError(
                         "Corrections for {} must be a dictionary".format(hostname)
@@ -168,6 +172,9 @@ class Config:
                             hostname, ", ".join(unsupported_corrections)
                         )
                     )
+
+                # Correct the typing on corrections
+                corrections = {MetricIds[k]: float(v) for k, v in corrections.items()}
 
                 self.all_devices.append(
                     Device(
@@ -189,7 +196,10 @@ class Config:
                     )
                 tags["id"] = id
 
-                corrections = item_dict.get("corrections", dict())
+                corrections = {
+                    k.upper(): v
+                    for k, v in item_dict.get("corrections", dict()).items()
+                }
                 if not isinstance(corrections, dict):
                     raise InvalidConfigurationError(
                         "Corrections for {} must be a dictionary".format(id)
@@ -203,6 +213,9 @@ class Config:
                             id, ", ".join(unsupported_corrections)
                         )
                     )
+
+                # Correct the typing on corrections
+                corrections = {MetricIds[k]: float(v) for k, v in corrections.items()}
 
                 self.all_devices.append(
                     Device(map_id=id, url=url, tags=tags, corrections=corrections)
@@ -262,7 +275,9 @@ class PurpleAirCollector:
                     # Update the labels dict so that it can be used to
                     # produce values in the correct order
                     labels_dict[k] = v
-                gauge.add_metric(labels_dict.values(), stat.value)
+                gauge.add_metric(
+                    labels_dict.values(), float(stat.value) + float(stat.correction)
+                )
             yield gauge
 
     def collect_gauges_for_local_device(self, device: Device) -> Iterable[Stat]:
@@ -275,16 +290,21 @@ class PurpleAirCollector:
             if metric.computed:
                 continue
 
+            # We may have an adjustment to make to the value
+            correction = device.corrections.get(metric.id, 0)
+
             if metric.multiple_sensors:
                 if metric.local_json_key:
                     yield Stat(
                         id=metric.id,
                         value=float(data[metric.local_json_key]),
+                        correction=correction,
                         labels=dict(labels, sensor="A"),
                     )
                     yield Stat(
                         id=metric.id,
                         value=float(data[metric.local_json_key + "_b"]),
+                        correction=correction,
                         labels=dict(labels, sensor="B"),
                     )
                 elif metric.labeled_json_keys:
@@ -292,11 +312,13 @@ class PurpleAirCollector:
                         yield Stat(
                             id=metric.id,
                             value=float(data[json_key]),
+                            correction=correction,
                             labels=dict(labels, **additional_labels, sensor="A"),
                         )
                         yield Stat(
                             id=metric.id,
                             value=float(data[json_key + "_b"]),
+                            correction=correction,
                             labels=dict(labels, **additional_labels, sensor="B"),
                         )
                 else:
@@ -307,6 +329,7 @@ class PurpleAirCollector:
                     yield Stat(
                         id=metric.id,
                         value=data[metric.local_json_key],
+                        correction=correction,
                         labels=labels,
                     )
                 else:
@@ -342,7 +365,8 @@ class PurpleAirCollector:
             ]:
                 yield Stat(
                     id=metric_id,
-                    value=val,
+                    value=float(val),
+                    correction=0,
                     labels=dict(labels, sensor=sensor),
                 )
 
@@ -357,16 +381,21 @@ class PurpleAirCollector:
             if metric.computed:
                 continue
 
+            # We may have an adjustment to make to the value
+            correction = device.corrections.get(metric.id, 0)
+
             if metric.multiple_sensors:
                 if metric.remote_json_key:
                     yield Stat(
                         id=metric.id,
                         value=float(results[0][metric.remote_json_key]),
+                        correction=correction,
                         labels=dict(labels, sensor="A"),
                     )
                     yield Stat(
                         id=metric.id,
                         value=float(results[1][metric.remote_json_key]),
+                        correction=correction,
                         labels=dict(labels, sensor="B"),
                     )
                 elif metric.labeled_json_keys:
@@ -374,11 +403,13 @@ class PurpleAirCollector:
                         yield Stat(
                             id=metric.id,
                             value=float(results[0][json_key]),
+                            correction=correction,
                             labels=dict(labels, **additional_labels, sensor="A"),
                         )
                         yield Stat(
                             id=metric.id,
                             value=float(results[1][json_key]),
+                            correction=correction,
                             labels=dict(labels, **additional_labels, sensor="B"),
                         )
                 else:
@@ -389,6 +420,7 @@ class PurpleAirCollector:
                     yield Stat(
                         id=metric.id,
                         value=results[0][metric.remote_json_key],
+                        correction=correction,
                         labels=labels,
                     )
                 else:
@@ -424,7 +456,8 @@ class PurpleAirCollector:
             ]:
                 yield Stat(
                     id=metric_id,
-                    value=val,
+                    value=float(val),
+                    correction=0,
                     labels=dict(labels, sensor=sensor),
                 )
 
