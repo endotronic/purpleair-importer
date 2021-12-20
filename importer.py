@@ -39,6 +39,7 @@ LabeledJsonKey = Tuple[str, Dict[str, str]]
 class Device:
     tags = attr.ib(type=Dict[str, str])
     corrections = attr.ib(type=Dict[MetricIds, float])
+    excluded_sensors = attr.ib(type=List[str])
     url = attr.ib(type=str)
     hostname = attr.ib(type=Optional[str], default=None)
     map_id = attr.ib(type=Optional[str], default=None)
@@ -176,9 +177,14 @@ class Config:
                 # Correct the typing on corrections
                 corrections = {MetricIds[k]: float(v) for k, v in corrections.items()}
 
+                excluded_sensors = item_dict.get("excluded_sensors", "").split(",")
                 self.all_devices.append(
                     Device(
-                        hostname=hostname, url=url, tags=tags, corrections=corrections
+                        hostname=hostname,
+                        url=url,
+                        tags=tags,
+                        corrections=corrections,
+                        excluded_sensors=excluded_sensors,
                     )
                 )
                 self.all_tag_keys = self.all_tag_keys.union(tags.keys())
@@ -217,8 +223,15 @@ class Config:
                 # Correct the typing on corrections
                 corrections = {MetricIds[k]: float(v) for k, v in corrections.items()}
 
+                excluded_sensors = item_dict.get("excluded_sensors", "").split(",")
                 self.all_devices.append(
-                    Device(map_id=id, url=url, tags=tags, corrections=corrections)
+                    Device(
+                        map_id=id,
+                        url=url,
+                        tags=tags,
+                        corrections=corrections,
+                        excluded_sensors=excluded_sensors,
+                    )
                 )
                 self.all_tag_keys = self.all_tag_keys.union(tags.keys())
 
@@ -295,32 +308,36 @@ class PurpleAirCollector:
 
             if metric.multiple_sensors:
                 if metric.local_json_key:
-                    yield Stat(
-                        id=metric.id,
-                        value=float(data[metric.local_json_key]),
-                        correction=correction,
-                        labels=dict(labels, sensor="A"),
-                    )
-                    yield Stat(
-                        id=metric.id,
-                        value=float(data[metric.local_json_key + "_b"]),
-                        correction=correction,
-                        labels=dict(labels, sensor="B"),
-                    )
+                    if "A" not in device.excluded_sensors:
+                        yield Stat(
+                            id=metric.id,
+                            value=float(data[metric.local_json_key]),
+                            correction=correction,
+                            labels=dict(labels, sensor="A"),
+                        )
+                    if "B" not in device.excluded_sensors:
+                        yield Stat(
+                            id=metric.id,
+                            value=float(data[metric.local_json_key + "_b"]),
+                            correction=correction,
+                            labels=dict(labels, sensor="B"),
+                        )
                 elif metric.labeled_json_keys:
                     for json_key, additional_labels in metric.labeled_json_keys:
-                        yield Stat(
-                            id=metric.id,
-                            value=float(data[json_key]),
-                            correction=correction,
-                            labels=dict(labels, **additional_labels, sensor="A"),
-                        )
-                        yield Stat(
-                            id=metric.id,
-                            value=float(data[json_key + "_b"]),
-                            correction=correction,
-                            labels=dict(labels, **additional_labels, sensor="B"),
-                        )
+                        if "A" not in device.excluded_sensors:
+                            yield Stat(
+                                id=metric.id,
+                                value=float(data[json_key]),
+                                correction=correction,
+                                labels=dict(labels, **additional_labels, sensor="A"),
+                            )
+                        if "B" not in device.excluded_sensors:
+                            yield Stat(
+                                id=metric.id,
+                                value=float(data[json_key + "_b"]),
+                                correction=correction,
+                                labels=dict(labels, **additional_labels, sensor="B"),
+                            )
                 else:
                     raise InvalidConfigurationError("Metrics are misconfigured")
 
@@ -342,6 +359,9 @@ class PurpleAirCollector:
         pm10_a = float(data["pm10_0_atm"])
         pm10_b = float(data["pm10_0_atm_b"])
         for sensor, pm2_5, pm10 in [("A", pm2_5_a, pm10_a), ("B", pm2_5_b, pm10_b)]:
+            if sensor in device.excluded_sensors:
+                continue
+
             aqi_std = aqi.to_aqi(
                 [
                     (aqi.POLLUTANT_PM25, pm2_5),
@@ -386,32 +406,36 @@ class PurpleAirCollector:
 
             if metric.multiple_sensors:
                 if metric.remote_json_key:
-                    yield Stat(
-                        id=metric.id,
-                        value=float(results[0][metric.remote_json_key]),
-                        correction=correction,
-                        labels=dict(labels, sensor="A"),
-                    )
-                    yield Stat(
-                        id=metric.id,
-                        value=float(results[1][metric.remote_json_key]),
-                        correction=correction,
-                        labels=dict(labels, sensor="B"),
-                    )
+                    if "A" not in device.excluded_sensors:
+                        yield Stat(
+                            id=metric.id,
+                            value=float(results[0][metric.remote_json_key]),
+                            correction=correction,
+                            labels=dict(labels, sensor="A"),
+                        )
+                    if "B" not in device.excluded_sensors:
+                        yield Stat(
+                            id=metric.id,
+                            value=float(results[1][metric.remote_json_key]),
+                            correction=correction,
+                            labels=dict(labels, sensor="B"),
+                        )
                 elif metric.labeled_json_keys:
                     for json_key, additional_labels in metric.labeled_json_keys:
-                        yield Stat(
-                            id=metric.id,
-                            value=float(results[0][json_key]),
-                            correction=correction,
-                            labels=dict(labels, **additional_labels, sensor="A"),
-                        )
-                        yield Stat(
-                            id=metric.id,
-                            value=float(results[1][json_key]),
-                            correction=correction,
-                            labels=dict(labels, **additional_labels, sensor="B"),
-                        )
+                        if "A" not in device.excluded_sensors:
+                            yield Stat(
+                                id=metric.id,
+                                value=float(results[0][json_key]),
+                                correction=correction,
+                                labels=dict(labels, **additional_labels, sensor="A"),
+                            )
+                        if "B" not in device.excluded_sensors:
+                            yield Stat(
+                                id=metric.id,
+                                value=float(results[1][json_key]),
+                                correction=correction,
+                                labels=dict(labels, **additional_labels, sensor="B"),
+                            )
                 else:
                     raise InvalidConfigurationError("Metrics are misconfigured")
 
@@ -433,6 +457,9 @@ class PurpleAirCollector:
         pm10_a = float(results[0]["pm10_0_atm"])
         pm10_b = float(results[1]["pm10_0_atm"])
         for sensor, pm2_5, pm10 in [("A", pm2_5_a, pm10_a), ("B", pm2_5_b, pm10_b)]:
+            if sensor in device.excluded_sensors:
+                continue
+
             aqi_std = aqi.to_aqi(
                 [
                     (aqi.POLLUTANT_PM25, pm2_5),
