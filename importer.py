@@ -269,29 +269,36 @@ class PurpleAirCollector:
                 )
 
         for metric in METRICS:
-            labels = self.config.all_tag_keys
-            if metric.labeled_json_keys:
-                label_set = set(metric.labeled_json_keys[0][1].keys())
-                for _, label_dict in metric.labeled_json_keys:
-                    label_set_b = set(label_dict.keys())
-                    assert label_set_b == label_set, "Metric labels do not match"
-                labels = labels.union(label_set)
+            try:
+                if not metric.id in stats_by_metric:
+                    self.logger.debug("Missing metric %s", metric.name)
+                    continue
 
-            labels_dict = dict([(label, None) for label in labels])
-            gauge = GaugeMetricFamily(
-                metric.name,
-                metric.help_text,
-                labels=labels_dict.keys(),
-            )
-            for stat in stats_by_metric[metric.id]:
-                for k, v in stat.labels.items():
-                    # Update the labels dict so that it can be used to
-                    # produce values in the correct order
-                    labels_dict[k] = v
-                gauge.add_metric(
-                    labels_dict.values(), float(stat.value) + float(stat.correction)
+                labels = self.config.all_tag_keys
+                if metric.labeled_json_keys:
+                    label_set = set(metric.labeled_json_keys[0][1].keys())
+                    for _, label_dict in metric.labeled_json_keys:
+                        label_set_b = set(label_dict.keys())
+                        assert label_set_b == label_set, "Metric labels do not match"
+                    labels = labels.union(label_set)
+
+                labels_dict = dict([(label, None) for label in labels])
+                gauge = GaugeMetricFamily(
+                    metric.name,
+                    metric.help_text,
+                    labels=labels_dict.keys(),
                 )
-            yield gauge
+                for stat in stats_by_metric[metric.id]:
+                    for k, v in stat.labels.items():
+                        # Update the labels dict so that it can be used to
+                        # produce values in the correct order
+                        labels_dict[k] = v
+                    gauge.add_metric(
+                        labels_dict.values(), float(stat.value) + float(stat.correction)
+                    )
+                yield gauge
+            except:
+                self.logger.exception("Failed to assemble gauge")
 
     def collect_gauges_for_local_device(self, device: Device) -> Iterable[Stat]:
         labels = {k: str(device.tags.get(k, "")) for k in self.config.all_tag_keys}
