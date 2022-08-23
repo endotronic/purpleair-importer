@@ -41,6 +41,7 @@ class Device:
     corrections = attr.ib(type=Dict[MetricIds, float])
     excluded_sensors = attr.ib(type=List[str])
     url = attr.ib(type=str)
+    api_read_key = attr.ib(type=Optional[str], default=None)
     hostname = attr.ib(type=Optional[str], default=None)
     map_id = attr.ib(type=Optional[str], default=None)
 
@@ -52,7 +53,10 @@ class Metric:
     help_text = attr.ib(type=str)
     local_json_key = attr.ib(type=Optional[str], default=None)
     remote_json_key = attr.ib(type=Optional[str], default=None)
-    labeled_json_keys = attr.ib(type=Optional[List[LabeledJsonKey]], default=None)
+    local_labeled_json_keys = attr.ib(type=Optional[List[LabeledJsonKey]], default=None)
+    remote_labeled_json_keys = attr.ib(
+        type=Optional[List[LabeledJsonKey]], default=None
+    )
     multiple_sensors = attr.ib(type=bool, default=False)
     computed = attr.ib(type=bool, default=False)
 
@@ -88,10 +92,15 @@ METRICS = [
         id=MetricIds.MASS_CONCENTRATION,
         name="purpleair_mass_concentration",
         help_text="Mass concentration at sensor.",
-        labeled_json_keys=[
+        local_labeled_json_keys=[
             ("pm1_0_atm", {"particle_size": "PM1.0", "particle_size_um": "1.0"}),
             ("pm2_5_atm", {"particle_size": "PM2.5", "particle_size_um": "2.5"}),
             ("pm10_0_atm", {"particle_size": "PM10.0", "particle_size_um": "10.0"}),
+        ],
+        remote_labeled_json_keys=[
+            ("pm1.0_atm", {"particle_size": "PM1.0", "particle_size_um": "1.0"}),
+            ("pm2.5_atm", {"particle_size": "PM2.5", "particle_size_um": "2.5"}),
+            ("pm10.0_atm", {"particle_size": "PM10.0", "particle_size_um": "10.0"}),
         ],
         multiple_sensors=True,
     ),
@@ -99,13 +108,21 @@ METRICS = [
         id=MetricIds.PARTICLE_COUNT,
         name="purpleair_particle_count",
         help_text="Particle count at sensor.",
-        labeled_json_keys=[
+        local_labeled_json_keys=[
             ("p_0_3_um", {"particle_size": ">0.3um"}),
             ("p_0_5_um", {"particle_size": ">0.5um"}),
             ("p_1_0_um", {"particle_size": ">1.0um"}),
             ("p_2_5_um", {"particle_size": ">2.5um"}),
             ("p_5_0_um", {"particle_size": ">5.0um"}),
             ("p_10_0_um", {"particle_size": ">10.0um"}),
+        ],
+        remote_labeled_json_keys=[
+            ("0.3_um_count", {"particle_size": ">0.3um"}),
+            ("0.5_um_count", {"particle_size": ">0.5um"}),
+            ("1.0_um_count", {"particle_size": ">1.0um"}),
+            ("2.5_um_count", {"particle_size": ">2.5um"}),
+            ("5.0_um_count", {"particle_size": ">5.0um"}),
+            ("10.0_um_count", {"particle_size": ">10.0um"}),
         ],
         multiple_sensors=True,
     ),
@@ -114,7 +131,7 @@ METRICS = [
         name="purpleair_temperature_f",
         help_text="Temperature at sensor. May be corrected during import.",
         local_json_key="current_temp_f",
-        remote_json_key="temp_f",
+        remote_json_key="temperature",
     ),
     Metric(
         id=MetricIds.HUMIDITY,
@@ -194,7 +211,8 @@ class Config:
                 if "id" not in item_dict:
                     raise InvalidConfigurationError("id required for all map devices")
                 id = item_dict["id"]
-                url = "https://www.purpleair.com/json?show={}".format(id)
+                url = "https://api.purpleair.com/v1/sensors/{}".format(id)
+                api_read_key = item_dict["api_read_key"]
                 tags = item_dict.get("tags")
                 if not isinstance(tags, dict):
                     raise InvalidConfigurationError(
@@ -228,6 +246,7 @@ class Config:
                     Device(
                         map_id=id,
                         url=url,
+                        api_read_key=api_read_key,
                         tags=tags,
                         corrections=corrections,
                         excluded_sensors=excluded_sensors,
@@ -275,9 +294,16 @@ class PurpleAirCollector:
                     continue
 
                 labels = self.config.all_tag_keys
-                if metric.labeled_json_keys:
-                    label_set = set(metric.labeled_json_keys[0][1].keys())
-                    for _, label_dict in metric.labeled_json_keys:
+                if metric.local_labeled_json_keys:
+                    label_set = set(metric.local_labeled_json_keys[0][1].keys())
+                    for _, label_dict in metric.local_labeled_json_keys:
+                        label_set_b = set(label_dict.keys())
+                        assert label_set_b == label_set, "Metric labels do not match"
+                    labels = labels.union(label_set)
+
+                if metric.remote_labeled_json_keys:
+                    label_set = set(metric.remote_labeled_json_keys[0][1].keys())
+                    for _, label_dict in metric.remote_labeled_json_keys:
                         label_set_b = set(label_dict.keys())
                         assert label_set_b == label_set, "Metric labels do not match"
                     labels = labels.union(label_set)
@@ -329,8 +355,8 @@ class PurpleAirCollector:
                             correction=correction,
                             labels=dict(labels, sensor="B"),
                         )
-                elif metric.labeled_json_keys:
-                    for json_key, additional_labels in metric.labeled_json_keys:
+                elif metric.local_labeled_json_keys:
+                    for json_key, additional_labels in metric.local_labeled_json_keys:
                         if "A" not in device.excluded_sensors:
                             yield Stat(
                                 id=metric.id,
@@ -400,9 +426,9 @@ class PurpleAirCollector:
     def collect_gauges_for_remote_device(self, device: Device) -> Iterable[Stat]:
         labels = {k: str(device.tags.get(k, "")) for k in self.config.all_tag_keys}
 
-        response = self.map_query_session.get(device.url)
-        results = response.json()["results"]
-        assert len(results) == 2
+        headers = {"X-API-Key": device.api_read_key}
+        response = self.map_query_session.get(device.url, headers=headers)
+        data = response.json()["sensor"]
 
         for metric in METRICS:
             if metric.computed:
@@ -416,30 +442,30 @@ class PurpleAirCollector:
                     if "A" not in device.excluded_sensors:
                         yield Stat(
                             id=metric.id,
-                            value=float(results[0][metric.remote_json_key]),
+                            value=float(data[metric.remote_json_key] + "_a"),
                             correction=correction,
                             labels=dict(labels, sensor="A"),
                         )
                     if "B" not in device.excluded_sensors:
                         yield Stat(
                             id=metric.id,
-                            value=float(results[1][metric.remote_json_key]),
+                            value=float(data[metric.remote_json_key + "_b"]),
                             correction=correction,
                             labels=dict(labels, sensor="B"),
                         )
-                elif metric.labeled_json_keys:
-                    for json_key, additional_labels in metric.labeled_json_keys:
+                elif metric.remote_labeled_json_keys:
+                    for json_key, additional_labels in metric.remote_labeled_json_keys:
                         if "A" not in device.excluded_sensors:
                             yield Stat(
                                 id=metric.id,
-                                value=float(results[0][json_key]),
+                                value=float(data[json_key]),
                                 correction=correction,
                                 labels=dict(labels, **additional_labels, sensor="A"),
                             )
                         if "B" not in device.excluded_sensors:
                             yield Stat(
                                 id=metric.id,
-                                value=float(results[1][json_key]),
+                                value=float(data[json_key + "_b"]),
                                 correction=correction,
                                 labels=dict(labels, **additional_labels, sensor="B"),
                             )
@@ -450,7 +476,7 @@ class PurpleAirCollector:
                 if metric.remote_json_key:
                     yield Stat(
                         id=metric.id,
-                        value=results[0][metric.remote_json_key],
+                        value=data[metric.remote_json_key],
                         correction=correction,
                         labels=labels,
                     )
@@ -459,10 +485,10 @@ class PurpleAirCollector:
 
         # The following could be made generic and programatic, but it's more trouble than
         # its worth until there are other calculations besides AQI.
-        pm2_5_a = float(results[0]["pm2_5_atm"])
-        pm2_5_b = float(results[1]["pm2_5_atm"])
-        pm10_a = float(results[0]["pm10_0_atm"])
-        pm10_b = float(results[1]["pm10_0_atm"])
+        pm2_5_a = float(data["pm2.5_atm_a"])
+        pm2_5_b = float(data["pm2.5_atm_b"])
+        pm10_a = float(data["pm10.0_atm_a"])
+        pm10_b = float(data["pm10.0_atm_b"])
         for sensor, pm2_5, pm10 in [("A", pm2_5_a, pm10_a), ("B", pm2_5_b, pm10_b)]:
             if sensor in device.excluded_sensors:
                 continue
@@ -507,13 +533,13 @@ if __name__ == "__main__":
         "-i",
         "--map_query_interval",
         help="minimum interval for map queries (in seconds)",
-        default=15,
+        default=60,
     )
     parser.add_argument(
         "-l",
         "--local_query_interval",
         help="minimum interval for local queries (in seconds)",
-        default=3,
+        default=5,
     )
     parser.add_argument(
         "-t", "--timeout", help="timeout for each API call (in seconds)", default=3
